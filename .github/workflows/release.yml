@@ -1,0 +1,95 @@
+# Copyright (C) 2026 Lucas Menendez
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: |
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify merged commit
+        run: |
+          CGO_ENABLED=0 go test ./...
+          CGO_ENABLED=0 go build ./...
+
+      - name: Compute version
+        id: version
+        env:
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: ./scripts/next-version.sh
+
+      - name: Create tag and release
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous }}
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+
+          local_sha=$(git rev-parse -q --verify "refs/tags/$TAG^{}" || true)
+          if [[ -n "$local_sha" && "$local_sha" != "$head" ]]; then
+            echo "tag $TAG points to $local_sha, expected $head" >&2
+            exit 1
+          fi
+
+          remote_sha=$(git ls-remote --tags origin "refs/tags/$TAG^{}" | awk '{print $1}')
+          if [[ -z "$remote_sha" ]]; then
+            remote_sha=$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}')
+          fi
+          if [[ -n "$remote_sha" && "$remote_sha" != "$head" ]]; then
+            echo "remote tag $TAG points to $remote_sha, expected $head" >&2
+            exit 1
+          fi
+
+          if [[ -z "$remote_sha" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            if [[ -z "$local_sha" ]]; then
+              git tag -a "$TAG" -m "$TAG" "$head"
+            fi
+            git push origin "refs/tags/$TAG"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+            exit 0
+          fi
+
+          flags=(--verify-tag --generate-notes --title "$TAG")
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            flags+=(--notes-start-tag "$PREVIOUS_TAG")
+          fi
+          if [[ "$PRERELEASE" == "true" ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" "${flags[@]}"

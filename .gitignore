@@ -1,0 +1,18 @@
+# Secrets and local data
+secrets/
+*.key
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+*.env
+!.env.example
+!.env.template
+
+# Local build and coverage artifacts
+coverage.out
+coverage.txt
+coverage.html
+*.test

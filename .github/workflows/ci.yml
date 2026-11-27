@@ -1,0 +1,164 @@
+# Copyright (C) 2026 Lucas Menendez
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Check SPDX headers
+        run: |
+          missing=0
+          while IFS= read -r file; do
+            if ! grep -q 'SPDX-License-Identifier: AGPL-3.0-only' "$file"; then
+              echo "Missing AGPL SPDX header: $file"
+              missing=1
+            fi
+          done < <(find . -name '*.go' -not -path './.git/*')
+          exit "$missing"
+      - name: Vet
+        run: go vet ./...
+      - name: Check go.mod and go.sum
+        run: go mod tidy && git diff --exit-code -- go.mod go.sum
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15-intel, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./...
+      - run: go build ./...
+
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race ./...
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Collect coverage
+        run: |
+          go test -covermode=atomic -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out > coverage.txt
+          go tool cover -html=coverage.out -o coverage.html
+      - name: Write per-file summary
+        run: |
+          {
+            echo "### Coverage by file"
+            echo
+            echo "| File | Covered | Total | % |"
+            echo "|---|---:|---:|---:|"
+            awk 'NR > 1 {
+              split($1, p, ":")
+              file = p[1]
+              total[file] += $2
+              if ($3 + 0 > 0) covered[file] += $2
+            }
+            END {
+              for (f in total)
+                if (total[f] > 0)
+                  printf "| `%s` | %d | %d | %.1f%% |\n", f, covered[f], total[f],
+                         100 * covered[f] / total[f]
+            }' coverage.out | sort
+            echo
+            echo "**Total:** $(tail -n 1 coverage.txt | awk '{print $NF}')"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.txt
+            coverage.html
+          retention-days: 14
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -run='^$' -fuzz=FuzzDecrypt -fuzztime=30s .
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashers
+          path: testdata/fuzz/
+          if-no-files-found: ignore
+
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -run='^$' -bench=. -benchmem -benchtime=1s ./...
+
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
